@@ -1,0 +1,13 @@
+[Unit]
+Description=Show unread Steam chat messages on the taskbar
+Documentation=https://github.com/Tiaxi/steam-chat-badge
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/steam-chat-badge
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

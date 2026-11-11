@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Show unread Steam chat messages on the Linux desktop taskbar.
+
+The Steam client on Linux ignores its own "Flash window when I receive a chat
+message" setting, and nothing on the desktop shows that a message is waiting
+once the pop-up has disappeared. This daemon reads the unread state from the
+Steam client through its local Chromium DevTools port and shows it:
+
+* as a count badge on the Steam taskbar icon, through the
+  com.canonical.Unity.LauncherEntry D-Bus API (KDE Plasma, Dash to Dock, ...),
+* by setting _NET_WM_STATE_DEMANDS_ATTENTION on the Steam windows, which is
+  what "flash the taskbar button" means on X11. The window manager clears it
+  when a Steam window is activated.
+
+Requirements: Python 3.10+, PyGObject (for D-Bus) and libX11 (for the window
+flag). Steam must be started with remote CEF debugging enabled, which is done
+by creating an empty `.cef-enable-remote-debugging` file in the Steam folder.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import ctypes
+import ctypes.util
+import hashlib
+import json
+import logging
+import os
+import signal
+import socket
+import struct
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from dataclasses import dataclass
+from typing import Any, Optional
+
+__version__ = "0.1.0"
+
+log = logging.getLogger("steam-chat-badge")
+
+DEFAULT_PORT = 8080
+DEFAULT_APP_URI = "application://steam.desktop"
+SHARED_JS_CONTEXT_TITLE = "SharedJSContext"
+
+# Steam's "Flash window when I receive a chat message" values.
+FLASH_ALWAYS, FLASH_MINIMIZED, FLASH_NEVER = 0, 1, 2
+
+# Runs inside Steam's SharedJSContext, where the friends and chat UI lives.
+# GetChatsWithUnreadPriorityMessages() is what the Steam client itself uses
+# for its unread indicator on Windows: direct messages, plus group chat
+# messages that the user's notification settings mark as important.
+UNREAD_EXPRESSION = r"""
+(() => {
+  const app = window.g_FriendsUIApp;
+  const store = app && app.ChatStore;
+  if (!store || typeof store.GetChatsWithUnreadPriorityMessages !== "function") {
+    return null;
+  }
+  const chats = store.GetChatsWithUnreadPriorityMessages();
+  let messages = 0;
+  for (const chat of chats) {
+    messages += Math.max(1, Number(chat.unread_message_count) || 0);
+  }
+  const friends = app.FriendStore;
+  const settings = app.SettingsStore && app.SettingsStore.FriendsSettings;
+  return {
+    chats: chats.length,
+    messages: messages,
+    doNotDisturb: !!(friends && typeof friends.GetUserDoNotDisturb === "function"
+                     && friends.GetUserDoNotDisturb()),
+    flashMode: settings ? Number(settings.nChatFlashMode) : 0,
+  };
+})()
+"""
+
+
+# --------------------------------------------------------------------------
+# Unread state and the decision of what to show
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Unread:
+    chats: int
+    messages: int
+    do_not_disturb: bool = False
+    flash_mode: int = FLASH_ALWAYS
+
+
+@dataclass(frozen=True)
+class BadgeState:
+    count: int = 0
+    messages: int = 0
+    attention: bool = False
+
+
+def parse_unread(value: Any) -> Optional[Unread]:
+    """Turn the value returned by UNREAD_EXPRESSION into an Unread."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        return Unread(
+            chats=max(0, int(value.get("chats", 0))),
+            messages=max(0, int(value.get("messages", 0))),
+            do_not_disturb=bool(value.get("doNotDisturb", False)),
+            flash_mode=int(value.get("flashMode", FLASH_ALWAYS)),
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def next_state(prev: BadgeState, unread: Optional[Unread], steam_active: bool,
+               count_mode: str = "messages") -> BadgeState:
+    """Decide the badge count and whether Steam should ask for attention.
+
+    Attention is raised when a new message arrives while no Steam window is
+    active, and dropped once the user looks at Steam or reads everything.
+    The badge count stays until the messages are read.
+    """
+    if unread is None or unread.messages <= 0:
+        return BadgeState()
+    count = unread.chats if count_mode == "chats" else unread.messages
+    may_flash = unread.flash_mode != FLASH_NEVER and not unread.do_not_disturb
+    if not may_flash or steam_active:
+        attention = False
+    elif unread.messages > prev.messages:
+        attention = True
+    else:
+        attention = prev.attention
+    return BadgeState(count=count, messages=unread.messages, attention=attention)
+
+
+# --------------------------------------------------------------------------
+# Minimal WebSocket client (RFC 6455), enough for the DevTools protocol
+# --------------------------------------------------------------------------
+
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_MAX_MESSAGE = 64 * 1024 * 1024
+
+
+class WebSocketError(Exception):
+    pass
+
+
+class WebSocketClosed(WebSocketError):
+    pass
+
+
+def apply_mask(data: bytes, mask: bytes) -> bytes:
+    if not data:
+        return b""
+    key = (mask * (len(data) // 4 + 1))[: len(data)]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(key, "big")).to_bytes(len(data), "big")
+
+
+def encode_frame(opcode: int, payload: bytes, mask: bytes) -> bytes:
+    """Encode one final, masked client frame."""
+    header = bytearray([0x80 | opcode])
+    length = len(payload)
+    if length < 126:
+        header.append(0x80 | length)
+    elif length < 1 << 16:
+        header.append(0x80 | 126)
+        header += struct.pack(">H", length)
+    else:
+        header.append(0x80 | 127)
+        header += struct.pack(">Q", length)
+    return bytes(header) + mask + apply_mask(payload, mask)
+
+
+class WebSocket:
+    def __init__(self, sock: socket.socket):
+        self.sock = sock
+        self._buffer = b""
+
+    @classmethod
+    def connect(cls, url: str, timeout: float) -> "WebSocket":
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme != "ws" or not parts.hostname:
+            raise WebSocketError(f"unsupported WebSocket URL: {url}")
+        port = parts.port or 80
+        path = parts.path or "/"
+        if parts.query:
+            path += "?" + parts.query
+        sock = socket.create_connection((parts.hostname, port), timeout=timeout)
+        ws = cls(sock)
+        try:
+            ws.handshake(f"{parts.hostname}:{port}", path)
+        except BaseException:
+            sock.close()
+            raise
+        return ws
+
+    def handshake(self, host: str, path: str) -> None:
+        key = base64.b64encode(os.urandom(16)).decode()
+        # No Origin header: Chromium only accepts DevTools clients that send
+        # one when it was started with a matching --remote-allow-origins.
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(request.encode())
+        head = self._read_until(b"\r\n\r\n").decode("iso-8859-1")
+        lines = head.split("\r\n")
+        status = lines[0].split(" ", 2)
+        if len(status) < 2 or status[1] != "101":
+            raise WebSocketError(f"handshake rejected: {lines[0]}")
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+        if headers.get("sec-websocket-accept") != expected:
+            raise WebSocketError("handshake returned a wrong Sec-WebSocket-Accept")
+
+    def _recv_some(self) -> bytes:
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise WebSocketClosed("connection closed")
+        return chunk
+
+    def _read_until(self, marker: bytes) -> bytes:
+        while marker not in self._buffer:
+            if len(self._buffer) > 65536:
+                raise WebSocketError("handshake response too large")
+            self._buffer += self._recv_some()
+        head, _, self._buffer = self._buffer.partition(marker)
+        return head
+
+    def _read_exact(self, size: int) -> bytes:
+        while len(self._buffer) < size:
+            self._buffer += self._recv_some()
+        data, self._buffer = self._buffer[:size], self._buffer[size:]
+        return data
+
+    def _send(self, opcode: int, payload: bytes) -> None:
+        self.sock.sendall(encode_frame(opcode, payload, os.urandom(4)))
+
+    def send_text(self, text: str) -> None:
+        self._send(0x1, text.encode())
+
+    def recv_text(self) -> str:
+        fragments: list[bytes] = []
+        size = 0
+        while True:
+            first, second = self._read_exact(2)
+            fin, opcode = first & 0x80, first & 0x0F
+            length = second & 0x7F
+            if length == 126:
+                length = struct.unpack(">H", self._read_exact(2))[0]
+            elif length == 127:
+                length = struct.unpack(">Q", self._read_exact(8))[0]
+            mask = self._read_exact(4) if second & 0x80 else None
+            if size + length > _MAX_MESSAGE:
+                raise WebSocketError("message too large")
+            payload = self._read_exact(length)
+            if mask:
+                payload = apply_mask(payload, mask)
+            if opcode == 0x8:
+                raise WebSocketClosed("server closed the connection")
+            if opcode == 0x9:
+                self._send(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x2):
+                fragments = [payload]
+                size = length
+            elif opcode == 0x0 and fragments:
+                fragments.append(payload)
+                size += length
+            else:
+                raise WebSocketError(f"unexpected frame opcode {opcode}")
+            if fin:
+                return b"".join(fragments).decode("utf-8")
+
+    def close(self) -> None:
+        try:
+            self._send(0x8, b"")
+        except OSError:
+            pass
+        self.sock.close()
+
+
+# --------------------------------------------------------------------------
+# Chromium DevTools protocol
+# --------------------------------------------------------------------------
+
+
+class DevToolsError(Exception):
+    pass
+
+
+def find_shared_js_context(port: int, timeout: float = 3.0) -> str:
+    """Return the DevTools WebSocket URL of Steam's SharedJSContext page."""
+    url = f"http://127.0.0.1:{port}/json/list"
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        targets = json.load(response)
+    for target in targets:
+        if target.get("title") == SHARED_JS_CONTEXT_TITLE and target.get("webSocketDebuggerUrl"):
+            return target["webSocketDebuggerUrl"]
+    raise DevToolsError("Steam's SharedJSContext is not available yet")
+
+
+class DevToolsSession:
+    def __init__(self, ws_url: str, timeout: float = 10.0):
+        self.ws = WebSocket.connect(ws_url, timeout)
+        self._next_id = 0
+
+    def call(self, method: str, params: Optional[dict] = None) -> dict:
+        self._next_id += 1
+        message_id = self._next_id
+        self.ws.send_text(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+        while True:
+            message = json.loads(self.ws.recv_text())
+            if message.get("id") != message_id:
+                continue  # an event or a stale reply
+            if "error" in message:
+                raise DevToolsError(f"{method} failed: {message['error']}")
+            return message.get("result", {})
+
+    def evaluate(self, expression: str) -> Any:
+        result = self.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+        if "exceptionDetails" in result:
+            details = result["exceptionDetails"]
+            text = details.get("exception", {}).get("description") or details.get("text")
+            raise DevToolsError(f"evaluation failed: {text}")
+        return result.get("result", {}).get("value")
+
+    def close(self) -> None:
+        self.ws.close()
+
+
+# --------------------------------------------------------------------------
+# Taskbar badge: com.canonical.Unity.LauncherEntry
+# --------------------------------------------------------------------------
+
+
+class LauncherBadge:
+    """Count badge on the taskbar icon of one or more desktop entries.
+
+    Docks drop the badge when the sending D-Bus connection goes away, so the
+    connection is kept open for the lifetime of the daemon.
+    """
+
+    INTERFACE = "com.canonical.Unity.LauncherEntry"
+
+    def __init__(self, app_uris: list[str]):
+        import gi
+
+        gi.require_version("Gio", "2.0")
+        gi.require_version("GLib", "2.0")
+        from gi.repository import Gio, GLib
+
+        self._GLib = GLib
+        self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        self.app_uris = app_uris
+
+    def update(self, count: int, urgent: bool) -> None:
+        GLib = self._GLib
+        for uri in self.app_uris:
+            props = {
+                "count": GLib.Variant("x", count),
+                "count-visible": GLib.Variant("b", count > 0),
+                "urgent": GLib.Variant("b", urgent),
+            }
+            path = f"/com/canonical/unity/launcherentry/{zlib.crc32(uri.encode())}"
+            self.bus.emit_signal(None, path, self.INTERFACE, "Update",
+                                 GLib.Variant("(sa{sv})", (uri, props)))
+        self.bus.flush_sync(None)
+
+
+# --------------------------------------------------------------------------
+# Window attention: _NET_WM_STATE_DEMANDS_ATTENTION on the Steam windows
+# --------------------------------------------------------------------------
+
+
+class _XClientMessageEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("message_type", ctypes.c_ulong),
+        ("format", ctypes.c_int),
+        ("data", ctypes.c_long * 5),
+    ]
+
+
+class _XEvent(ctypes.Union):
+    _fields_ = [("xclient", _XClientMessageEvent), ("pad", ctypes.c_long * 24)]
+
+
+_X_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+
+class WindowAttention:
+    """Talks to the window manager over X11. The Steam client is an X11 app,
+    so this also works under Wayland through Xwayland."""
+
+    CLIENT_MESSAGE = 33
+    SUBSTRUCTURE_MASK = (1 << 19) | (1 << 20)  # SubstructureNotify | SubstructureRedirect
+    NET_WM_STATE_REMOVE, NET_WM_STATE_ADD = 0, 1
+    RETRY_SECONDS = 30.0
+
+    def __init__(self, wm_class: str):
+        self.wm_class = wm_class.lower()
+        path = ctypes.util.find_library("X11")
+        if not path:
+            raise OSError("libX11 not found")
+        x = ctypes.CDLL(path)
+        x.XOpenDisplay.restype = ctypes.c_void_p
+        x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x.XInternAtom.restype = ctypes.c_ulong
+        x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+        x.XDefaultRootWindow.restype = ctypes.c_ulong
+        x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        x.XGetWindowProperty.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_long, ctypes.c_long,
+            ctypes.c_int, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_void_p),
+        ]
+        x.XFree.argtypes = [ctypes.c_void_p]
+        x.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long,
+                                 ctypes.POINTER(_XEvent)]
+        x.XFlush.argtypes = [ctypes.c_void_p]
+        x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        x.XSetErrorHandler.argtypes = [_X_ERROR_HANDLER]
+        x.XSetErrorHandler.restype = ctypes.c_void_p
+        self.x = x
+        # Windows can disappear between listing and querying them. Xlib's
+        # default handler would exit the process on the resulting BadWindow.
+        self._error_handler = _X_ERROR_HANDLER(lambda display, event: 0)
+        x.XSetErrorHandler(self._error_handler)
+        self.display: Optional[int] = None
+        self._atoms: dict[str, int] = {}
+        self._last_attempt = float("-inf")
+
+    def _connect(self) -> bool:
+        # If the X server goes away later, Xlib exits the process; the systemd
+        # unit restarts it.
+        if self.display:
+            return True
+        now = time.monotonic()
+        if now - self._last_attempt < self.RETRY_SECONDS:
+            return False
+        self._last_attempt = now
+        display = self.x.XOpenDisplay(None)
+        if not display:
+            log.warning("cannot open X display %r; taskbar flashing is disabled for now",
+                        os.environ.get("DISPLAY"))
+            return False
+        self.display = display
+        self.root = self.x.XDefaultRootWindow(display)
+        return True
+
+    def _atom(self, name: str) -> int:
+        if name not in self._atoms:
+            self._atoms[name] = self.x.XInternAtom(self.display, name.encode(), 0)
+        return self._atoms[name]
+
+    def _property(self, window: int, name: str) -> tuple[int, bytes, int]:
+        """Return (format, raw bytes, item count) of a window property."""
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        remaining = ctypes.c_ulong()
+        data = ctypes.c_void_p()
+        status = self.x.XGetWindowProperty(
+            self.display, window, self._atom(name), 0, 4096, 0, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_format), ctypes.byref(nitems),
+            ctypes.byref(remaining), ctypes.byref(data))
+        if status != 0 or not data.value:
+            return 0, b"", 0
+        try:
+            fmt = actual_format.value
+            # Xlib hands back 32-bit items as C longs.
+            item_size = {8: 1, 16: ctypes.sizeof(ctypes.c_short), 32: ctypes.sizeof(ctypes.c_long)}.get(fmt, 0)
+            return fmt, ctypes.string_at(data.value, nitems.value * item_size), nitems.value
+        finally:
+            self.x.XFree(data)
+
+    def _ids(self, window: int, name: str) -> list[int]:
+        fmt, raw, count = self._property(window, name)
+        if fmt != 32:
+            return []
+        return list((ctypes.c_ulong * count).from_buffer_copy(raw))
+
+    def _is_steam(self, window: int) -> bool:
+        fmt, raw, _ = self._property(window, "WM_CLASS")
+        if fmt != 8:
+            return False
+        names = [part.decode("utf-8", "replace").lower() for part in raw.split(b"\0") if part]
+        if self.wm_class not in names:
+            return False
+        skip = self._atom("_NET_WM_STATE_SKIP_TASKBAR")
+        return skip not in self._ids(window, "_NET_WM_STATE")
+
+    def steam_windows(self) -> list[int]:
+        if not self._connect():
+            return []
+        return [w for w in self._ids(self.root, "_NET_CLIENT_LIST") if self._is_steam(w)]
+
+    def steam_active(self) -> bool:
+        if not self._connect():
+            return False
+        active = self._ids(self.root, "_NET_ACTIVE_WINDOW")
+        return bool(active and active[0] and self._is_steam(active[0]))
+
+    def set_attention(self, on: bool) -> int:
+        windows = self.steam_windows()
+        for window in windows:
+            event = _XEvent()
+            message = event.xclient
+            message.type = self.CLIENT_MESSAGE
+            message.send_event = 1
+            message.display = self.display
+            message.window = window
+            message.message_type = self._atom("_NET_WM_STATE")
+            message.format = 32
+            message.data[0] = self.NET_WM_STATE_ADD if on else self.NET_WM_STATE_REMOVE
+            message.data[1] = self._atom("_NET_WM_STATE_DEMANDS_ATTENTION")
+            message.data[3] = 1  # source indication: normal application
+            self.x.XSendEvent(self.display, self.root, 0, self.SUBSTRUCTURE_MASK, ctypes.byref(event))
+        if self.display:
+            self.x.XSync(self.display, 0)
+        return len(windows)
+
+
+# --------------------------------------------------------------------------
+# Daemon
+# --------------------------------------------------------------------------
+
+
+class Daemon:
+    BADGE_REFRESH_SECONDS = 60.0
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.stop = threading.Event()
+        self.state = BadgeState()
+        self.badge = None if args.no_badge else LauncherBadge(args.app_uri)
+        self.windows: Optional[WindowAttention] = None
+        if not args.no_attention:
+            try:
+                self.windows = WindowAttention(args.wm_class)
+            except OSError as error:
+                log.warning("taskbar flashing is disabled: %s", error)
+        self._last_badge_emit = float("-inf")
+
+    def apply(self, unread: Optional[Unread]) -> None:
+        prev = self.state
+        steam_active = self.windows.steam_active() if (self.windows and unread) else False
+        state = next_state(prev, unread, steam_active, self.args.count)
+        self.state = state
+
+        if state.messages != prev.messages:
+            if state.messages:
+                log.info("unread: %d message(s) in %d chat(s)", state.messages, unread.chats)
+            else:
+                log.info("no unread messages")
+
+        if self.windows and (state.attention != prev.attention
+                             or (state.attention and state.messages > prev.messages)):
+            flagged = self.windows.set_attention(state.attention)
+            log.debug("attention %s on %d Steam window(s)", "set" if state.attention else "cleared", flagged)
+
+        now = time.monotonic()
+        changed = (state.count, state.attention) != (prev.count, prev.attention)
+        # Re-send a non-zero badge now and then, so it comes back after the
+        # panel or dock restarts.
+        refresh = state.count and now - self._last_badge_emit > self.BADGE_REFRESH_SECONDS
+        if self.badge and (changed or refresh):
+            self.badge.update(state.count, state.attention)
+            self._last_badge_emit = now
+
+    def run(self) -> None:
+        waiting_logged = False
+        try:
+            while not self.stop.is_set():
+                session = None
+                try:
+                    session = DevToolsSession(find_shared_js_context(self.args.port))
+                    log.info("connected to Steam on port %d", self.args.port)
+                    waiting_logged = False
+                    while not self.stop.is_set():
+                        self.apply(parse_unread(session.evaluate(UNREAD_EXPRESSION)))
+                        self.stop.wait(self.args.interval)
+                except (OSError, ValueError, WebSocketError, DevToolsError) as error:
+                    if session is not None:
+                        log.info("lost connection to Steam: %s", error)
+                    elif not waiting_logged:
+                        log.info("waiting for Steam on port %d (%s)", self.args.port, error)
+                        waiting_logged = True
+                    self.apply(None)
+                    self.stop.wait(self.args.retry)
+                finally:
+                    if session is not None:
+                        session.close()
+        finally:
+            self.apply(None)
+
+
+def print_once(args: argparse.Namespace) -> int:
+    try:
+        session = DevToolsSession(find_shared_js_context(args.port))
+    except (OSError, ValueError, WebSocketError, DevToolsError) as error:
+        print(f"cannot reach Steam on port {args.port}: {error}", file=sys.stderr)
+        return 1
+    try:
+        print(json.dumps(session.evaluate(UNREAD_EXPRESSION)))
+    finally:
+        session.close()
+    return 0
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="steam-chat-badge",
+        description="Show unread Steam chat messages on the taskbar.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help="Steam's CEF remote debugging port (default: %(default)s)")
+    parser.add_argument("--interval", type=float, default=2.0,
+                        help="seconds between unread checks (default: %(default)s)")
+    parser.add_argument("--retry", type=float, default=5.0,
+                        help="seconds between attempts to reach Steam (default: %(default)s)")
+    parser.add_argument("--count", choices=("messages", "chats"), default="messages",
+                        help="what the badge number counts (default: %(default)s)")
+    parser.add_argument("--app-uri", action="append",
+                        help=f"desktop entry to badge, repeatable (default: {DEFAULT_APP_URI})")
+    parser.add_argument("--wm-class", default="steam",
+                        help="X11 WM_CLASS of the Steam windows (default: %(default)s)")
+    parser.add_argument("--no-badge", action="store_true", help="do not show a count badge")
+    parser.add_argument("--no-attention", action="store_true", help="do not flash the taskbar entry")
+    parser.add_argument("--once", action="store_true",
+                        help="print Steam's unread state as JSON and exit")
+    parser.add_argument("-v", "--verbose", action="store_true", help="log debug messages")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args(argv)
+    if not args.app_uri:
+        args.app_uri = [DEFAULT_APP_URI]
+    if args.interval <= 0 or args.retry <= 0:
+        parser.error("--interval and --retry must be positive")
+    return args
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s: %(message)s" if os.environ.get("INVOCATION_ID") else "%(asctime)s %(levelname)s: %(message)s",
+    )
+    if args.once:
+        return print_once(args)
+
+    daemon = Daemon(args)
+
+    def request_stop(signum: int, _frame: Any) -> None:
+        log.info("stopping (%s)", signal.Signals(signum).name)
+        daemon.stop.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    daemon.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
